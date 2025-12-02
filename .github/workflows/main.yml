@@ -26,9 +26,7 @@ jobs:
       - name: Clone upstream honse-farm repo
         id: clone
         env:
-          SRC_URL: ${{ secrets.SOURCE_REPO_URL }}
-          SRC_USER: ${{ secrets.SOURCE_REPO_USER }}
-          SRC_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+          SRC_URL: https://git.honse.farm/astraea/honse-farm.git
         run: |
           set -euo pipefail
 
@@ -53,29 +51,23 @@ jobs:
           echo "Latest upstream commit: $LATEST_COMMIT"
           echo "latest_commit=$LATEST_COMMIT" >> "$GITHUB_OUTPUT"
 
-      - name: Check if upstream changed (via cache)
-        id: changed
+      - name: Cache marker for upstream commit
+        id: cache
         uses: actions/cache@v4
         with:
           path: .upstream-honse-cache
           key: upstream-honse-${{ steps.upstream.outputs.latest_commit }}
-        # cache-hit = already built this commit → "no change"
-        # cache-miss = new commit → "changed"
+
       - name: Decide changed flag
-        id: decide
-        run: |
-          if [ "${{ steps.changed.outputs.cache-hit }}" = 'true' ]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Upstream commit has been built before; skipping builds."
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "New upstream commit; will build Dockerfiles."
-          fi
-      - name: Expose changed flag
         id: changed
         run: |
-          # We forward the changed flag from 'decide' into this step's outputs
-          echo "changed=${{ steps.decide.outputs.changed }}" >> "$GITHUB_OUTPUT"
+          if [ "${{ steps.cache.outputs.cache-hit }}" = 'true' ]; then
+            echo "Upstream commit has been built before; skipping builds."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New upstream commit; will build Dockerfiles."
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build Dockerfile matrix (if changed)
         id: make_matrix
@@ -97,9 +89,6 @@ jobs:
           echo "$DOCKERFILES"
 
           # Build JSON matrix: include[{path, context, name}]
-          # - path   = relative path to Dockerfile
-          # - context= directory containing Dockerfile
-          # - name   = safe image name suffix derived from directory path
           MATRIX_JSON=$(echo "$DOCKERFILES" | \
             jq -R -s '
               split("\n")
@@ -159,15 +148,13 @@ jobs:
 
           mkdir -p artifacts
 
-          # Choose an image name local to the build (not pushing anywhere)
-          # Example: honse/${name}:<upstream-commit-short>
+          # Use upstream commit as tag
           COMMIT="${{ needs.detect-and-prepare.outputs.upstream_commit }}"
           TAG="${COMMIT::7}"
           IMAGE_NAME="honse/${{ matrix.name }}:${TAG}"
 
-          echo "Image name: ${IMAGE_NAME}"
+          echo "Image name (local): ${IMAGE_NAME}"
 
-          # Build an OCI image tarball (multi-arch) so you can later load/push it
           OUTPUT_TAR="artifacts/${{ matrix.name }}-${TAG}.oci.tar"
 
           docker buildx build \
