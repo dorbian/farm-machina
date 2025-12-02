@@ -1,9 +1,8 @@
-name: Sync honse-farm & Build Dockerfiles (amd64+arm64)
+name: Sync upstream honse-farm & Build Dockerfiles (multi-arch)
 
 on:
   schedule:
-    # Every hour; tweak as needed
-    - cron: "0 * * * *"
+    - cron: "0 * * * *"   # hourly
   workflow_dispatch:
 
 permissions:
@@ -15,95 +14,69 @@ jobs:
     runs-on: ubuntu-latest
 
     outputs:
-      changed: ${{ steps.changed.outputs.changed }}
+      changed: ${{ steps.check.outputs.changed }}
       upstream_commit: ${{ steps.upstream.outputs.latest_commit }}
-      matrix: ${{ steps.make_matrix.outputs.matrix }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
 
     steps:
-      - name: Checkout this repo (target)
-        uses: actions/checkout@v4
-
       - name: Clone upstream honse-farm repo
-        id: clone
-        env:
-          SRC_URL: https://git.honse.farm/astraea/honse-farm.git
         run: |
-          set -euo pipefail
-
-          if [ -z "${SRC_URL:-}" ] || [ -z "${SRC_USER:-}" ] || [ -z "${SRC_TOKEN:-}" ]; then
-            echo "ERROR: You must set SOURCE_REPO_URL, SOURCE_REPO_USER and SOURCE_REPO_TOKEN as repo/org secrets."
-            exit 1
-          fi
-
-          STRIPPED="${SRC_URL#https://}"
-          echo "Cloning upstream from $SRC_URL"
-          git clone "https://${SRC_USER}:${SRC_TOKEN}@${STRIPPED}" upstream-honse
+          git clone https://git.honse.farm/astraea/honse-farm.git upstream-honse
 
       - name: Determine latest upstream commit
         id: upstream
         run: |
-          set -euo pipefail
           cd upstream-honse
-          # Adjust branch name if not 'main'
-          UPSTREAM_BRANCH="main"
-          git checkout "$UPSTREAM_BRANCH"
-          LATEST_COMMIT="$(git rev-parse HEAD)"
-          echo "Latest upstream commit: $LATEST_COMMIT"
-          echo "latest_commit=$LATEST_COMMIT" >> "$GITHUB_OUTPUT"
+          git checkout main
+          COMMIT=$(git rev-parse HEAD)
+          echo "Latest upstream commit: $COMMIT"
+          echo "latest_commit=$COMMIT" >> $GITHUB_OUTPUT
 
-      - name: Cache marker for upstream commit
+      - name: Cache last processed commit
         id: cache
         uses: actions/cache@v4
         with:
-          path: .upstream-honse-cache
-          key: upstream-honse-${{ steps.upstream.outputs.latest_commit }}
+          path: .upstream-cache
+          key: upstream-${{ steps.upstream.outputs.latest_commit }}
 
-      - name: Decide changed flag
-        id: changed
+      - name: Check if repo changed
+        id: check
         run: |
-          if [ "${{ steps.cache.outputs.cache-hit }}" = 'true' ]; then
-            echo "Upstream commit has been built before; skipping builds."
-            echo "changed=false" >> "$GITHUB_OUTPUT"
+          if [ "${{ steps.cache.outputs.cache-hit }}" = "true" ]; then
+            echo "No upstream updates."
+            echo "changed=false" >> $GITHUB_OUTPUT
           else
-            echo "New upstream commit; will build Dockerfiles."
-            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Upstream updated."
+            echo "changed=true" >> $GITHUB_OUTPUT
           fi
 
-      - name: Build Dockerfile matrix (if changed)
-        id: make_matrix
-        if: steps.changed.outputs.changed == 'true'
+      - name: Build Dockerfile matrix
+        id: matrix
+        if: steps.check.outputs.changed == 'true'
         run: |
-          set -euo pipefail
           cd upstream-honse
 
-          # Find all Dockerfiles
-          DOCKERFILES=$(find . -name 'Dockerfile' -print | sed 's|^\./||')
+          # Find Dockerfiles
+          FILES=$(find . -type f -name Dockerfile | sed 's|^\./||')
 
-          if [ -z "$DOCKERFILES" ]; then
-            echo "No Dockerfiles found in upstream repo."
-            echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
+          if [ -z "$FILES" ]; then
+            echo "matrix={\"include\":[]}" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          echo "Found Dockerfiles:"
-          echo "$DOCKERFILES"
+          echo "Dockerfiles found:"
+          echo "$FILES"
 
-          # Build JSON matrix: include[{path, context, name}]
-          MATRIX_JSON=$(echo "$DOCKERFILES" | \
-            jq -R -s '
-              split("\n")
-              | map(select(length>0))
-              | map({
-                  path: .,
-                  context: ( . | sub("/Dockerfile$";"") | if . == "" then "." else . end ),
-                  name: ( . | sub("/Dockerfile$";"") | gsub("[^a-zA-Z0-9._-]"; "-") | if . == "" then "root" else . end )
-                })
-            ')
+          MATRIX=$(echo "$FILES" | jq -R -s '
+            split("\n") | map(select(length > 0))
+            | map({
+                path: .,
+                context: ( . | sub("/Dockerfile$";"") | if . == "" then "." else . end ),
+                name: ( . | sub("/Dockerfile$";"") | gsub("[^a-zA-Z0-9._-]"; "-") | if . == "" then "root" else . end )
+            })
+          ')
 
-          echo "Dockerfile matrix: $MATRIX_JSON"
-
-          # GitHub matrix expects an object with "include": [...]
-          echo "matrix={\"include\":${MATRIX_JSON}}" >> "$GITHUB_OUTPUT"
+          echo "matrix={\"include\":${MATRIX}}" >> $GITHUB_OUTPUT
 
   build-images:
     name: Build all Dockerfiles (amd64+arm64)
@@ -116,59 +89,37 @@ jobs:
       matrix: ${{ fromJson(needs.detect-and-prepare.outputs.matrix) }}
 
     steps:
-      - name: Checkout this repo (target)
-        uses: actions/checkout@v4
-
       - name: Clone upstream honse-farm repo
-        env:
-          SRC_URL: ${{ secrets.SOURCE_REPO_URL }}
-          SRC_USER: ${{ secrets.SOURCE_REPO_USER }}
-          SRC_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
         run: |
-          set -euo pipefail
+          git clone https://git.honse.farm/astraea/honse-farm.git upstream-honse
 
-          STRIPPED="${SRC_URL#https://}"
-          git clone "https://${SRC_USER}:${SRC_TOKEN}@${STRIPPED}" upstream-honse
-
-      - name: Set up QEMU for multi-arch
+      - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
-      - name: Set up Docker Buildx
+      - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Build multi-arch image for ${{ matrix.name }}
         run: |
-          set -euo pipefail
-
-          DOCKERFILE_PATH="upstream-honse/${{ matrix.path }}"
-          CONTEXT_DIR="upstream-honse/${{ matrix.context }}"
-
-          echo "Building image for Dockerfile: ${DOCKERFILE_PATH}"
-          echo "Context: ${CONTEXT_DIR}"
-
-          mkdir -p artifacts
-
-          # Use upstream commit as tag
           COMMIT="${{ needs.detect-and-prepare.outputs.upstream_commit }}"
           TAG="${COMMIT::7}"
-          IMAGE_NAME="honse/${{ matrix.name }}:${TAG}"
 
-          echo "Image name (local): ${IMAGE_NAME}"
+          DOCKERFILE="upstream-honse/${{ matrix.path }}"
+          CONTEXT="upstream-honse/${{ matrix.context }}"
 
-          OUTPUT_TAR="artifacts/${{ matrix.name }}-${TAG}.oci.tar"
+          mkdir -p artifacts
+          OUTPUT="artifacts/${{ matrix.name }}-${TAG}.oci.tar"
 
           docker buildx build \
             --platform linux/amd64,linux/arm64 \
-            --file "${DOCKERFILE_PATH}" \
-            --tag "${IMAGE_NAME}" \
-            --output type=oci,dest="${OUTPUT_TAR}" \
-            "${CONTEXT_DIR}"
+            --file "$DOCKERFILE" \
+            --output "type=oci,dest=${OUTPUT}" \
+            "$CONTEXT"
 
-          echo "Built multi-arch image and saved to ${OUTPUT_TAR}"
+          echo "Built image saved as ${OUTPUT}"
 
-      - name: Upload built images as artifacts
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: honse-images-${{ needs.detect-and-prepare.outputs.upstream_commit }}
           path: artifacts/
-          if-no-files-found: error
