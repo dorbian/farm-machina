@@ -2,7 +2,7 @@ name: Sync upstream honse-farm & Build Dockerfiles (multi-arch)
 
 on:
   schedule:
-    - cron: "0 * * * *"   # hourly
+    - cron: "0 * * * *"   # hourly, tweak as needed
   workflow_dispatch:
 
 permissions:
@@ -21,16 +21,17 @@ jobs:
     steps:
       - name: Clone upstream honse-farm repo
         run: |
+          set -euo pipefail
           git clone https://git.honse.farm/astraea/honse-farm.git upstream-honse
 
-      - name: Determine latest upstream commit
+      - name: Determine latest upstream commit (dev branch)
         id: upstream
         run: |
+          set -euo pipefail
           cd upstream-honse
-          # Use dev branch instead of main
           git checkout dev
           COMMIT=$(git rev-parse HEAD)
-          echo "Latest upstream commit: $COMMIT"
+          echo "Latest upstream dev commit: $COMMIT"
           echo "latest_commit=$COMMIT" >> "$GITHUB_OUTPUT"
 
       - name: Cache last processed commit
@@ -38,16 +39,16 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .upstream-cache
-          key: upstream-${{ steps.upstream.outputs.latest_commit }}
+          key: upstream-dev-${{ steps.upstream.outputs.latest_commit }}
 
       - name: Check if repo changed
         id: check
         run: |
           if [ "${{ steps.cache.outputs.cache-hit }}" = "true" ]; then
-            echo "No upstream updates."
+            echo "No upstream updates on dev."
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
-            echo "Upstream updated."
+            echo "Upstream dev updated."
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -55,6 +56,7 @@ jobs:
         id: matrix
         if: steps.check.outputs.changed == 'true'
         run: |
+          set -euo pipefail
           cd upstream-honse
 
           # Find Dockerfiles AND Dockerfile.* variants
@@ -69,21 +71,32 @@ jobs:
           echo "Dockerfiles found:"
           echo "$FILES"
 
-          # Build compact JSON matrix: include[{path, name}]
+          # Build compact JSON matrix: include[{path, name, platforms}]
+          # - path: relative path to Dockerfile
+          # - name: directory of Dockerfile → safe image name
+          # - platforms:
+          #     * default: linux/amd64,linux/arm64
+          #     * adminpanel: linux/amd64 only (to avoid QEMU+Node illegal instruction)
           MATRIX=$(echo "$FILES" | jq -R -s '
             split("\n")
             | map(select(length>0))
             | map({
                 path: .,
-                # directory of the Dockerfile, used for image name
-                name: ( . | sub("/Dockerfile(\\..*)?$";"") | gsub("[^a-zA-Z0-9._-]"; "-") | if . == "" then "root" else . end )
+                name: ( . 
+                        | sub("/Dockerfile(\\..*)?$";"") 
+                        | gsub("[^a-zA-Z0-9._-]"; "-") 
+                        | if . == "" then "root" else . end ),
+                platforms: ( if contains("HonseFarm.Adminpanel") 
+                             then "linux/amd64"
+                             else "linux/amd64,linux/arm64"
+                           end )
               })
           ' | jq -c '.')
 
           echo "matrix={\"include\":${MATRIX}}" >> "$GITHUB_OUTPUT"
 
   build-images:
-    name: Build all Dockerfiles (amd64+arm64)
+    name: Build all Dockerfiles (multi-arch per matrix)
     needs: detect-and-prepare
     runs-on: ubuntu-latest
     if: needs.detect-and-prepare.outputs.changed == 'true'
@@ -95,6 +108,7 @@ jobs:
     steps:
       - name: Clone upstream honse-farm repo
         run: |
+          set -euo pipefail
           git clone https://git.honse.farm/astraea/honse-farm.git upstream-honse
           cd upstream-honse
           git checkout dev
@@ -114,24 +128,26 @@ jobs:
 
           DOCKERFILE="upstream-honse/${{ matrix.path }}"
           CONTEXT="upstream-honse"
+          PLATFORMS="${{ matrix.platforms }}"
 
           echo "Building for Dockerfile: $DOCKERFILE"
           echo "Context (repo root): $CONTEXT"
+          echo "Platforms: $PLATFORMS"
 
           mkdir -p artifacts
           OUTPUT="artifacts/${{ matrix.name }}-${TAG}.oci.tar"
 
           docker buildx build \
-            --platform linux/amd64,linux/arm64 \
+            --platform "$PLATFORMS" \
             --file "$DOCKERFILE" \
             --output "type=oci,dest=${OUTPUT}" \
             "$CONTEXT"
 
-          echo "Built multi-arch image saved as ${OUTPUT}"
+          echo "Built image saved as ${OUTPUT}"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          # UNIQUE per matrix job to avoid 409 Conflict
+          # unique per dockerfile to avoid 409 conflicts
           name: honse-image-${{ matrix.name }}-${{ needs.detect-and-prepare.outputs.upstream_commit }}
           path: artifacts/
