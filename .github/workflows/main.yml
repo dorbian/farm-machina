@@ -56,8 +56,8 @@ jobs:
         run: |
           cd upstream-honse
 
-          # Find Dockerfiles
-          FILES=$(find . -type f -name Dockerfile | sed 's|^\./||')
+          # Find Dockerfiles AND Dockerfile.* variants
+          FILES=$(find . -type f \( -name 'Dockerfile' -o -name 'Dockerfile.*' \) | sed 's|^\./||')
 
           if [ -z "$FILES" ]; then
             echo "No Dockerfiles found."
@@ -68,19 +68,18 @@ jobs:
           echo "Dockerfiles found:"
           echo "$FILES"
 
-          # Build compact JSON matrix: include[{path, context, name}]
-          MATRIX=$(echo "$FILES" | \
-            jq -R -s '
-              split("\n")
-              | map(select(length>0))
-              | map({
-                  path: .,
-                  context: ( . | sub("/Dockerfile$";"") | if . == "" then "." else . end ),
-                  name: ( . | sub("/Dockerfile$";"") | gsub("[^a-zA-Z0-9._-]"; "-") | if . == "" then "root" else . end )
-                })
-            ' | jq -c '.')
+          # Build compact JSON matrix: include[{path, name}]
+          # context is ALWAYS repo root → we don't need it in the matrix anymore
+          MATRIX=$(echo "$FILES" | jq -R -s '
+            split("\n")
+            | map(select(length>0))
+            | map({
+                path: .,
+                # directory of the Dockerfile, used for image name
+                name: ( . | sub("/Dockerfile(\\..*)?$";"") | gsub("[^a-zA-Z0-9._-]"; "-") | if . == "" then "root" else . end )
+              })
+          ' | jq -c '.')
 
-          # ONE SINGLE LINE in the format key=value
           echo "matrix={\"include\":${MATRIX}}" >> "$GITHUB_OUTPUT"
 
   build-images:
@@ -107,14 +106,15 @@ jobs:
       - name: Build multi-arch image for ${{ matrix.name }}
         run: |
           set -euo pipefail
+
           COMMIT="${{ needs.detect-and-prepare.outputs.upstream_commit }}"
           TAG="${COMMIT::7}"
 
           DOCKERFILE="upstream-honse/${{ matrix.path }}"
-          CONTEXT="upstream-honse/${{ matrix.context }}"
+          CONTEXT="upstream-honse"
 
           echo "Building for Dockerfile: $DOCKERFILE"
-          echo "Context: $CONTEXT"
+          echo "Context (repo root): $CONTEXT"
 
           mkdir -p artifacts
           OUTPUT="artifacts/${{ matrix.name }}-${TAG}.oci.tar"
@@ -125,7 +125,7 @@ jobs:
             --output "type=oci,dest=${OUTPUT}" \
             "$CONTEXT"
 
-          echo "Built image saved as ${OUTPUT}"
+          echo "Built multi-arch image saved as ${OUTPUT}"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
