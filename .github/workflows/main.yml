@@ -27,7 +27,8 @@ jobs:
         id: upstream
         run: |
           cd upstream-honse
-          git checkout main
+          # Use dev branch instead of main
+          git checkout dev
           COMMIT=$(git rev-parse HEAD)
           echo "Latest upstream commit: $COMMIT"
           echo "latest_commit=$COMMIT" >> "$GITHUB_OUTPUT"
@@ -69,7 +70,6 @@ jobs:
           echo "$FILES"
 
           # Build compact JSON matrix: include[{path, name}]
-          # context is ALWAYS repo root → we don't need it in the matrix anymore
           MATRIX=$(echo "$FILES" | jq -R -s '
             split("\n")
             | map(select(length>0))
@@ -96,6 +96,8 @@ jobs:
       - name: Clone upstream honse-farm repo
         run: |
           git clone https://git.honse.farm/astraea/honse-farm.git upstream-honse
+          cd upstream-honse
+          git checkout dev
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -130,5 +132,6 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: honse-images-${{ needs.detect-and-prepare.outputs.upstream_commit }}
+          # UNIQUE per matrix job to avoid 409 Conflict
+          name: honse-image-${{ matrix.name }}-${{ needs.detect-and-prepare.outputs.upstream_commit }}
           path: artifacts/
