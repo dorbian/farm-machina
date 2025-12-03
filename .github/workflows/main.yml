@@ -1,166 +1,169 @@
-name: Sync upstream honse-farm & Build Dockerfiles into GHCR (multi-arch)
+name: Sync honse-farm from git.honse.farm & build images to GHCR
 
 on:
   schedule:
-    - cron: "0 * * * *"   # hourly; tweak as needed
+    - cron: "0 * * * *"  # hourly, tweak as you like
   workflow_dispatch:
 
 permissions:
-  contents: read
-  packages: write   # needed to push to GHCR
+  contents: write   # we will commit .upstream-commit
+  packages: write   # push to GHCR
 
 env:
-  REGISTRY: ghcr.io/${{ github.repository_owner }}
+  UPSTREAM_REPO: https://git.honse.farm/astraea/honse-farm.git
+  UPSTREAM_BRANCH: dev
+  REGISTRY: ghcr.io/dorbian
 
 jobs:
-  detect-and-prepare:
-    name: Detect upstream change & prepare matrix
+  sync-and-build:
     runs-on: ubuntu-latest
 
-    outputs:
-      changed: ${{ steps.check.outputs.changed }}
-      upstream_commit: ${{ steps.upstream.outputs.latest_commit }}
-      matrix: ${{ steps.matrix.outputs.matrix }}
-
     steps:
-      - name: Clone upstream honse-farm repo
-        run: |
-          set -euo pipefail
-          git clone https://git.honse.farm/astraea/honse-farm.git upstream-honse
+      # 1) Checkout THIS GitHub repo (with .upstream-commit)
+      - name: Checkout farm-machina (this repo)
+        uses: actions/checkout@v4
 
-      - name: Determine latest upstream commit (dev branch)
-        id: upstream
+      # 2) Read last upstream commit (local copy marker)
+      - name: Read last upstream commit (if any)
+        id: last
         run: |
-          set -euo pipefail
-          cd upstream-honse
-          git checkout dev
-          COMMIT=$(git rev-parse HEAD)
-          echo "Latest upstream dev commit: $COMMIT"
-          echo "latest_commit=$COMMIT" >> "$GITHUB_OUTPUT"
-
-      - name: Cache last processed commit
-        id: cache
-        uses: actions/cache@v4
-        with:
-          path: .upstream-cache
-          key: upstream-dev-${{ steps.upstream.outputs.latest_commit }}
-
-      - name: Check if repo changed
-        id: check
-        run: |
-          if [ "${{ steps.cache.outputs.cache-hit }}" = "true" ]; then
-            echo "No upstream updates on dev."
-            echo "changed=false" >> "$GITHUB_OUTPUT"
+          if [ -f .upstream-commit ]; then
+            LAST=$(cat .upstream-commit | tr -d '\n')
+            echo "Last upstream commit: $LAST"
+            echo "last_commit=$LAST" >> "$GITHUB_OUTPUT"
           else
-            echo "Upstream dev updated."
-            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "No previous upstream commit recorded."
+            echo "last_commit=" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build Dockerfile matrix
-        id: matrix
-        if: steps.check.outputs.changed == 'true'
+      # 3) Clone upstream and get current HEAD
+      - name: Clone upstream honse-farm (git.honse.farm)
         run: |
           set -euo pipefail
+          git clone "$UPSTREAM_REPO" upstream-honse
           cd upstream-honse
+          git checkout "$UPSTREAM_BRANCH"
+          NEW=$(git rev-parse HEAD)
+          echo "Current upstream dev commit: $NEW"
+          echo "new_commit=$NEW" >> "$GITHUB_OUTPUT"
+        id: upstream
 
-          # Find Dockerfiles AND Dockerfile.* variants
-          FILES=$(find . -type f \( -name 'Dockerfile' -o -name 'Dockerfile.*' \) | sed 's|^\./||')
+      # 4) Short-circuit if no change
+      - name: Decide whether to build
+        id: decide
+        run: |
+          LAST="${{ steps.last.outputs.last_commit }}"
+          NEW="${{ steps.upstream.outputs.new_commit }}"
 
-          if [ -z "$FILES" ]; then
-            echo "No Dockerfiles found."
-            echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
-            exit 0
+          if [ -n "$LAST" ] && [ "$LAST" = "$NEW" ]; then
+            echo "No new upstream commit. Skipping build."
+            echo "build_needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Upstream changed (last='$LAST', new='$NEW'). Will build."
+            echo "build_needed=true" >> "$GITHUB_OUTPUT"
           fi
 
-          echo "Dockerfiles found:"
-          echo "$FILES"
+      # 5) Stop here if nothing to do
+      - name: Stop if no build needed
+        if: steps.decide.outputs.build_needed != 'true'
+        run: echo "Done. Nothing changed upstream."
 
-          # Build compact JSON matrix: include[{path, name, platforms}]
-          # - path: relative path to Dockerfile
-          # - name: directory of Dockerfile → safe, lowercase image name suffix
-          # - platforms:
-          #     * default: linux/amd64,linux/arm64
-          #     * adminpanel: linux/amd64 only
-          MATRIX=$(echo "$FILES" | jq -R -s '
-            split("\n")
-            | map(select(length>0))
-            | map({
-                path: .,
-                raw_name: ( . 
-                            | sub("/Dockerfile(\\..*)?$";"") 
-                            | gsub("[^a-zA-Z0-9._-]"; "-") 
-                            | if . == "" then "root" else . end ),
-                platforms: ( if contains("HonseFarm.Adminpanel") 
-                             then "linux/amd64"
-                             else "linux/amd64,linux/arm64"
-                           end )
-              })
-            | map({
-                path: .path,
-                name: (.raw_name | ascii_downcase),
-                platforms: .platforms
-              })
-          ' | jq -c '.')
-
-          echo "matrix={\"include\":${MATRIX}}" >> "$GITHUB_OUTPUT"
-
-  build-and-push:
-    name: Build & push all Dockerfiles to GHCR
-    needs: detect-and-prepare
-    runs-on: ubuntu-latest
-    if: needs.detect-and-prepare.outputs.changed == 'true'
-
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.detect-and-prepare.outputs.matrix) }}
-
-    steps:
-      - name: Clone upstream honse-farm repo
-        run: |
-          set -euo pipefail
-          git clone https://git.honse.farm/astraea/honse-farm.git upstream-honse
-          cd upstream-honse
-          git checkout dev
-
+      # 6) Set up buildx & QEMU ONLY if we need to build
       - name: Set up QEMU
+        if: steps.decide.outputs.build_needed == 'true'
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Buildx
+        if: steps.decide.outputs.build_needed == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
+        if: steps.decide.outputs.build_needed == 'true'
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io \
             -u "${{ github.actor }}" --password-stdin
 
-      - name: Build & push image for ${{ matrix.name }}
-        env:
-          REGISTRY: ${{ env.REGISTRY }}
+      # 7) Find Dockerfiles and build/push images
+      - name: Build & push images
+        if: steps.decide.outputs.build_needed == 'true'
         run: |
           set -euo pipefail
 
-          COMMIT="${{ needs.detect-and-prepare.outputs.upstream_commit }}"
-          TAG="${COMMIT::7}"
+          NEW="${{ steps.upstream.outputs.new_commit }}"
+          TAG="${NEW::7}"
 
-          DOCKERFILE="upstream-honse/${{ matrix.path }}"
-          CONTEXT="upstream-honse"
-          PLATFORMS="${{ matrix.platforms }}"
+          cd upstream-honse
+          git checkout "$UPSTREAM_BRANCH"
 
-          # image repo: ghcr.io/<owner>/honse-<name>
-          IMAGE_REPO="${REGISTRY}/honse-${{ matrix.name }}"
-          IMAGE_TAG="${IMAGE_REPO}:${TAG}"
-          IMAGE_DEV="${IMAGE_REPO}:dev-latest"
+          # Find Dockerfiles and variants
+          DOCKERFILES=$(find . -type f \( -name 'Dockerfile' -o -name 'Dockerfile.*' \) | sed 's|^\./||')
 
-          echo "Building for Dockerfile: $DOCKERFILE"
-          echo "Context (repo root): $CONTEXT"
-          echo "Platforms: $PLATFORMS"
-          echo "Image (tagged): ${IMAGE_TAG} and ${IMAGE_DEV}"
+          echo "Dockerfiles found:"
+          echo "$DOCKERFILES"
 
-          # Build and push multi-arch image directly to GHCR
-          docker buildx build \
-            --platform "$PLATFORMS" \
-            --file "$DOCKERFILE" \
-            --tag "$IMAGE_TAG" \
-            --tag "$IMAGE_DEV" \
-            --push \
-            "$CONTEXT"
+          # For now, just handle known ones explicitly
+          SERVER_DF="HonseFarm.Server/Dockerfile"
+          FILESERVER_DF="HonseFarm.Fileserver/Dockerfile"
+          ADMINPANEL_DF="HonseFarm.Adminpanel/Dockerfile"
+
+          # SERVER (amd64+arm64)
+          if echo "$DOCKERFILES" | grep -q "^${SERVER_DF}$"; then
+            IMAGE="${REGISTRY}/honse-honsefarm.server"
+            docker buildx build \
+              --platform linux/amd64,linux/arm64 \
+              --file "$SERVER_DF" \
+              --tag "${IMAGE}:${TAG}" \
+              --tag "${IMAGE}:dev-latest" \
+              --push \
+              .
+          else
+            echo "WARNING: ${SERVER_DF} not found."
+          fi
+
+          # FILESERVER (amd64+arm64)
+          if echo "$DOCKERFILES" | grep -q "^${FILESERVER_DF}$"; then
+            IMAGE="${REGISTRY}/honse-honsefarm.fileserver"
+            docker buildx build \
+              --platform linux/amd64,linux/arm64 \
+              --file "$FILESERVER_DF" \
+              --tag "${IMAGE}:${TAG}" \
+              --tag "${IMAGE}:dev-latest" \
+              --push \
+              .
+          else
+            echo "WARNING: ${FILESERVER_DF} not found."
+          fi
+
+          # ADMINPANEL (amd64 only, because of Node/QEMU issues)
+          if echo "$DOCKERFILES" | grep -q "^${ADMINPANEL_DF}$"; then
+            IMAGE="${REGISTRY}/honse-honsefarm.adminpanel"
+            docker buildx build \
+              --platform linux/amd64 \
+              --file "$ADMINPANEL_DF" \
+              --tag "${IMAGE}:${TAG}" \
+              --tag "${IMAGE}:dev-latest" \
+              --push \
+              .
+          else
+            echo "WARNING: ${ADMINPANEL_DF} not found."
+          fi
+
+      # 8) Update .upstream-commit and commit it back
+      - name: Update .upstream-commit and push
+        if: steps.decide.outputs.build_needed == 'true'
+        run: |
+          set -euo pipefail
+          NEW="${{ steps.upstream.outputs.new_commit }}"
+
+          echo "$NEW" > .upstream-commit
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add .upstream-commit
+          if git diff --cached --quiet; then
+            echo "No changes to commit (unexpected)."
+          else
+            git commit -m "Sync upstream honse-farm dev at ${NEW}"
+            git push
+          fi
